@@ -33,27 +33,32 @@ def _build_creds_info():
     }
 
 @st.cache_resource(ttl=3600)
-def _get_client():
-    """gspreadクライアントを1時間キャッシュして使い回す"""
-    return gspread.service_account_from_dict(_build_creds_info())
+def _get_spreadsheet():
+    """スプレッドシートへの接続を1時間キャッシュして使い回す"""
+    client = gspread.service_account_from_dict(_build_creds_info())
+    return client.open_by_key(st.secrets["SPREADSHEET_ID"])
+
+@st.cache_resource(ttl=3600)
+def _get_ws_cached(sheet_name: str):
+    """ワークシートオブジェクト自体もキャッシュする（API呼び出し削減）"""
+    return _get_spreadsheet().worksheet(sheet_name)
 
 def get_ws(sheet_name: str):
-    """キャッシュしたクライアントでワークシートを返す"""
-    spreadsheet = _get_client().open_by_key(st.secrets["SPREADSHEET_ID"])
-    return spreadsheet.worksheet(sheet_name)
+    return _get_ws_cached(sheet_name)
 
-def _api_call_with_retry(func, *args, max_retries=5, **kwargs):
-    """レートリミット対策：429エラー時はリトライする"""
+def _api_call_with_retry(func, *args, max_retries=6, **kwargs):
+    """レートリミット対策：429エラー時は指数バックオフでリトライする"""
     for attempt in range(max_retries):
         try:
             return func(*args, **kwargs)
         except gspread.exceptions.APIError as e:
-            if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                wait = 2 ** attempt  # 1,2,4,8,16秒と指数的に待つ
+            err = str(e)
+            if "429" in err or "RESOURCE_EXHAUSTED" in err or "Quota exceeded" in err:
+                wait = min(2 ** attempt + 1, 60)
                 time.sleep(wait)
             else:
                 raise
-    raise Exception("Google Sheets APIのレートリミットを超えました。しばらく待ってから再試行してください。")
+    raise Exception("Google Sheets APIのレートリミットを超えました。1分ほど待ってから再試行してください。")
 
 def sheet_read(sheet_name: str) -> list:
     try:
@@ -66,8 +71,9 @@ def sheet_clear_and_write(sheet_name: str, rows: list):
     ws = get_ws(sheet_name)
     _api_call_with_retry(ws.clear)
     if rows:
-        time.sleep(0.5)  # clearの直後に書き込むと失敗しやすいため少し待つ
+        time.sleep(1)
         _api_call_with_retry(ws.append_rows, rows, value_input_option="RAW")
+    time.sleep(0.5)
 
 # ===== データ管理関数 =====
 
@@ -995,8 +1001,10 @@ def show_notion_import_page():
 
                 st.divider()
                 if st.button("✅ CSVを取り込む", use_container_width=True, type="primary", key="csv_import_btn"):
-                    existing = load_notion_history()
-                    new_records = []
+                    with st.spinner("取り込み中...少々お待ちください"):
+                        existing = load_notion_history()
+                        time.sleep(2)  # 読み取り後に少し待ってから書き込む
+                        new_records = []
                     for r in csv_rows:
                         dish = r.get("dish", "").strip()
                         if not dish:
